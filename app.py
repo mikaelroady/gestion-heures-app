@@ -39,7 +39,7 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import cm
 
-# --- FIX OBLIGATOIRE POUR STREAMLIT CLOUD (Force l'IPv4) ---
+# --- FIX OBLIGATOIRE POUR STREAMLIT CLOUD ---
 try:
     if not hasattr(socket, '_getaddrinfo_orig'):
         socket._getaddrinfo_orig = socket.getaddrinfo
@@ -51,7 +51,7 @@ except Exception as e:
     print(f"Erreur patch IPv4: {e}")
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="Paie Cloud", layout="wide", page_icon="☁️")
+st.set_page_config(page_title="Paie & RH", layout="wide", page_icon="👥")
 
 try:
     from jours_feries_france import JoursFeries
@@ -97,8 +97,12 @@ def run_query(query, params=None, fetch="all"):
 def init_db():
     queries = [
         '''CREATE TABLE IF NOT EXISTS salaries (
-            id SERIAL PRIMARY KEY, nom TEXT NOT NULL, mode_alternance INTEGER DEFAULT 0, 
-            solde_banque REAL DEFAULT 0, config_horaires TEXT)''',
+            id SERIAL PRIMARY KEY, 
+            nom TEXT NOT NULL, 
+            mode_alternance INTEGER DEFAULT 0, 
+            solde_banque REAL DEFAULT 0, 
+            config_horaires TEXT,
+            is_archived INTEGER DEFAULT 0)''',
         '''CREATE TABLE IF NOT EXISTS pointages (
             id SERIAL PRIMARY KEY, salarie_id INTEGER, date_pointage DATE, 
             m_start TEXT, m_end TEXT, a_start TEXT, a_end TEXT, 
@@ -115,10 +119,9 @@ def init_db():
 init_db()
 
 # =======================================================
-# TOUTES LES FONCTIONS (DÉFINIES AVANT UTILISATION)
+# FONCTIONS METIER
 # =======================================================
 
-# --- UTILITAIRES ---
 def str_to_time(time_str):
     if not time_str: return None
     try: return dt.strptime(time_str, "%H:%M").time()
@@ -169,9 +172,24 @@ def db_upsert_salarie(id_s, nom, mode, sched):
     j = json.dumps(sched)
     chk = run_query("SELECT id FROM salaries WHERE nom=%s", (nom,), fetch="one")
     if chk and (id_s is None or chk['id'] != id_s): return False, "Nom déjà existant."
-    if id_s is None: run_query('INSERT INTO salaries (nom, mode_alternance, config_horaires) VALUES (%s,%s,%s)', (nom, mode, j), fetch="none")
+    
+    # Par défaut is_archived = 0
+    if id_s is None: run_query('INSERT INTO salaries (nom, mode_alternance, config_horaires, is_archived) VALUES (%s,%s,%s,0)', (nom, mode, j), fetch="none")
     else: run_query('UPDATE salaries SET nom=%s, mode_alternance=%s, config_horaires=%s WHERE id=%s', (nom, mode, j, id_s), fetch="none")
     return True, "Sauvegardé."
+
+# GESTION ARCHIVAGE / SUPPRESSION
+def db_archive_salarie(s_id):
+    run_query('UPDATE salaries SET is_archived = 1 WHERE id = %s', (s_id,), fetch="none")
+
+def db_restore_salarie(s_id):
+    run_query('UPDATE salaries SET is_archived = 0 WHERE id = %s', (s_id,), fetch="none")
+
+def db_delete_salarie_total(s_id):
+    # Suppression en cascade manuelle
+    run_query('DELETE FROM pointages WHERE salarie_id = %s', (s_id,), fetch="none")
+    run_query('DELETE FROM banque_history WHERE salarie_id = %s', (s_id,), fetch="none")
+    run_query('DELETE FROM salaries WHERE id = %s', (s_id,), fetch="none")
 
 def db_save_pointage(s_id, d_obj, ms, me, ads, ae, stat, cmt):
     if isinstance(d_obj, str):
@@ -245,7 +263,8 @@ def restore_backup_json(json_file):
         for u in data.get('users', []):
             run_query("INSERT INTO users (username, password, is_admin, is_active) VALUES (%s,%s,%s,%s)", (u['username'], u['password'], u['is_admin'], u['is_active']), fetch="none")
         for s in data.get('salaries', []):
-            run_query("INSERT INTO salaries (id, nom, mode_alternance, solde_banque, config_horaires) OVERRIDING SYSTEM VALUE VALUES (%s,%s,%s,%s,%s)", (s['id'], s['nom'], s['mode_alternance'], s['solde_banque'], s['config_horaires']), fetch="none")
+            run_query("INSERT INTO salaries (id, nom, mode_alternance, solde_banque, config_horaires, is_archived) OVERRIDING SYSTEM VALUE VALUES (%s,%s,%s,%s,%s,COALESCE(%s, 0))",
+                      (s['id'], s['nom'], s['mode_alternance'], s['solde_banque'], s['config_horaires'], s.get('is_archived', 0)), fetch="none")
         for p in data.get('pointages', []):
             run_query("INSERT INTO pointages (salarie_id, date_pointage, m_start, m_end, a_start, a_end, statut, comment) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", (p['salarie_id'], p['date_pointage'], p['m_start'], p['m_end'], p['a_start'], p['a_end'], p['statut'], p['comment']), fetch="none")
         for b in data.get('banque_history', []):
@@ -360,7 +379,7 @@ if not st.session_state.logged_in:
             if st.form_submit_button("Go"):
                 s, adm = check_login(u, p)
                 if s=="OK": st.session_state.logged_in=True; st.session_state.username=u; st.session_state.is_admin=adm; st.rerun()
-                elif s=="PENDING": st.warning("Attente validation.")
+                elif s=="PENDING": st.warning("En attente validation.")
                 else: st.error("Erreur.")
     with t2:
         with st.form("s"):
@@ -371,27 +390,32 @@ if not st.session_state.logged_in:
                 else: st.error(m)
     st.stop()
 
-# --- APP SIDEBAR ---
+# --- APP ---
 with st.sidebar:
     role = "Admin" if st.session_state.is_admin else "User"
     st.write(f"👤 **{st.session_state.username}** ({role})")
     st.download_button("⬇️ BACKUP JSON", create_backup_json(), f"Backup_{date.today()}.json", "application/json")
-    st.markdown("---")
     
+    # --- ADMIN SECTION ---
     if st.session_state.is_admin:
+        st.markdown("---")
         st.header("🛠️ Admin")
         users = get_all_users()
         pending = [u['username'] for u in users if u['is_active'] == 0]
-        active = [u['username'] for u in users if u['is_active'] == 1 and u['username'] != st.session_state.username]
-        if pending:
-            st.error(f"{len(pending)} demande(s)")
-            tp = st.selectbox("Valider", pending)
-            c1,c2 = st.columns(2)
-            if c1.button("✅"): admin_actions_user("approve", tp); st.rerun()
-            if c2.button("❌"): admin_actions_user("reject", tp); st.rerun()
-        with st.expander("Gestion"):
-            if active:
-                tu = st.selectbox("Cible", active)
+        active_users = [u['username'] for u in users if u['is_active'] == 1 and u['username'] != st.session_state.username]
+        
+        # USERS
+        with st.expander("Utilisateurs", expanded=bool(pending)):
+            if pending:
+                st.error(f"{len(pending)} demande(s)")
+                tp = st.selectbox("Valider", pending)
+                c1,c2 = st.columns(2)
+                if c1.button("✅"): admin_actions_user("approve", tp); st.rerun()
+                if c2.button("❌"): admin_actions_user("reject", tp); st.rerun()
+            
+            if active_users:
+                st.caption("Comptes Actifs")
+                tu = st.selectbox("Cible", active_users)
                 act = st.selectbox("Action", ["Reset MDP", "Supprimer", "Co-Admin", "Donner droits", "Rétrograder"])
                 if act == "Reset MDP":
                     np = st.text_input("New Pass", type="password")
@@ -405,15 +429,63 @@ with st.sidebar:
                 elif act == "Rétrograder":
                     if st.button("Enlever Admin"): admin_actions_user("demote", tu); st.rerun()
 
+        # SALARIÉS (NOUVEAU)
+        with st.expander("Salariés (Départs/Archives)"):
+            # 1. Suppression / Archivage
+            # On récupère tous les salariés ACTIFS
+            sals_active = run_query("SELECT * FROM salaries WHERE is_archived=0", fetch="all")
+            if sals_active:
+                target_s = st.selectbox("Salarié Actif", [s['nom'] for s in sals_active])
+                s_id_target = next(s['id'] for s in sals_active if s['nom'] == target_s)
+                
+                c_arch, c_del = st.columns(2)
+                if c_arch.button("🗄️ Archiver (Départ)"):
+                    db_archive_salarie(s_id_target)
+                    st.success(f"{target_s} archivé."); st.rerun()
+                
+                if c_del.button("🗑️ Supprimer (Irréversible)"):
+                    db_delete_salarie_total(s_id_target)
+                    st.warning(f"{target_s} supprimé définitivement."); st.rerun()
+            else:
+                st.caption("Aucun salarié actif.")
+
+        # ARCHIVES
+        with st.expander("🗄️ Consulter Archives"):
+            sals_archived = run_query("SELECT * FROM salaries WHERE is_archived=1", fetch="all")
+            if sals_archived:
+                arch_s = st.selectbox("Dossier Archivé", [s['nom'] for s in sals_archived])
+                s_id_arch = next(s['id'] for s in sals_archived if s['nom'] == arch_s)
+                
+                if st.button("♻️ Restaurer (Ré-embauche)"):
+                    db_restore_salarie(s_id_arch)
+                    st.success(f"{arch_s} restauré !"); st.rerun()
+                
+                # Petit utilitaire pour voir les stats d'un archivé rapidement
+                st.caption("Export rapide d'un mois :")
+                arc_y = st.number_input("An", 2020, 2030, date.today().year, key="ay")
+                arc_m = st.number_input("Mois", 1, 12, 1, key="am")
+                if st.button("Générer PDF Archive"):
+                    # On doit récupérer la config horaires pour le calcul... on prend celle stockée
+                    # Note : si le contrat a changé entre temps, c'est approximatif, mais c'est une archive.
+                    s_obj = next(s for s in sals_archived if s['id'] == s_id_arch)
+                    stats_arch = calculate_stats(s_id_arch, arc_y, arc_m, s_obj['config_horaires'])
+                    pdf = create_pdf_releve(s_obj['nom'], f"{arc_m}/{arc_y}", stats_arch)
+                    st.download_button("Télécharger PDF", pdf, "archive.pdf", "application/pdf")
+            else:
+                st.caption("Aucune archive.")
+
     st.markdown("---")
-    st.header("⚙️ Salarié")
+    st.header("⚙️ Salarié (Actif)")
     mode = st.radio("Mode", ["Nouveau", "Modifier"], horizontal=True)
     f_nom, f_alt, f_sch, f_id = "", False, get_default_schedule(), None
+    
+    # On charge UNIQUEMENT les actifs pour le menu standard
+    emps_active = run_query("SELECT * FROM salaries WHERE is_archived=0", fetch="all")
+    
     if mode == "Modifier":
-        emps = run_query("SELECT * FROM salaries", fetch="all")
-        if emps:
-            sel = st.selectbox("Choisir", [e['nom'] for e in emps])
-            e_obj = next(e for e in emps if e['nom'] == sel)
+        if emps_active:
+            sel = st.selectbox("Choisir", [e['nom'] for e in emps_active])
+            e_obj = next(e for e in emps_active if e['nom'] == sel)
             if st.session_state['curr_emp_id'] != e_obj['id']:
                 for k in list(st.session_state.keys()): 
                     if k.startswith(("p_","i_","std_")): del st.session_state[k]
@@ -422,6 +494,7 @@ with st.sidebar:
             if e_obj['config_horaires']: f_sch = json.loads(e_obj['config_horaires'])
     else:
         if st.session_state['curr_emp_id']: st.session_state['curr_emp_id'] = None; st.rerun()
+
     use_alt = st.checkbox("Alternance", value=f_alt)
     n_in = st.text_input("Nom", value=f_nom)
     fp, fi = [], []
@@ -432,7 +505,8 @@ with st.sidebar:
     else:
         fp = render_week_inputs_simple("std", f_sch['paire'])
         fi = fp
-    if st.button("💾 SAUVEGARDER SALARIÉ"):
+        
+    if st.button("💾 SAUVEGARDER"):
         if n_in:
             ok, m = db_upsert_salarie(f_id, n_in, 1 if use_alt else 0, {'paire':fp, 'impaire':fi})
             if ok: st.success(m); st.rerun()
@@ -440,10 +514,11 @@ with st.sidebar:
 
     if st.button("Déconnexion", type="secondary"): st.session_state.logged_in=False; st.rerun()
 
-# --- MAIN APP ---
+# --- MAIN ---
 st.title("🗓️ Planning Cloud")
-employees = run_query("SELECT * FROM salaries", fetch="all")
-if not employees: st.warning("Créez un salarié.")
+employees = run_query("SELECT * FROM salaries WHERE is_archived=0", fetch="all")
+
+if not employees: st.warning("Aucun salarié actif.")
 else:
     c1, c2, c3, c4 = st.columns([2, 1, 1, 1.5])
     emp_map = {e['nom']: e for e in employees}
@@ -473,33 +548,6 @@ else:
             pdf = create_pdf_releve(curr_emp['nom'], f"{mo}/{yr}", stats)
             st.download_button("⬇️", pdf, f"Releve_{curr_emp['nom']}.pdf", "application/pdf")
 
-    # ACTIONS
-    st.markdown("### 🗓️ Saisie")
-    col_undo, col_fill = st.columns([1, 3])
-    with col_undo:
-        cnt = len(st.session_state.undo_stack)
-        if st.button(f"↩️ Annuler ({cnt})", disabled=cnt==0):
-            if restore_last_state(): st.toast("Annulé !"); st.rerun()
-    with col_fill:
-        if st.button("✨ Remplir vides"):
-            save_state_for_undo(curr_emp['id'], yr, mo)
-            existing = run_query('SELECT date_pointage FROM pointages WHERE salarie_id=%s AND date_pointage BETWEEN %s AND %s', (curr_emp['id'], f"{yr}-{mo:02d}-01", f"{yr}-{mo:02d}-31"), fetch="all")
-            existing_dates = [str(r['date_pointage']) for r in existing] if existing else []
-            days = [date(yr, mo, d) for d in range(1, calendar.monthrange(yr, mo)[1]+1)]
-            feries = JoursFeries.for_year(yr)
-            cnt = 0
-            for d in days:
-                iso = d.strftime("%Y-%m-%d")
-                if iso not in existing_dates:
-                    ms, me, ads, ae = get_config_for_day(curr_emp['config_horaires'], d)
-                    stat = "Normal"
-                    if feries.get(d): stat = "Normal"
-                    elif d.weekday() == 6: ms=me=ads=ae=None
-                    db_save_pointage(curr_emp['id'], iso, ms, me, ads, ae, stat, "")
-                    cnt += 1
-            st.success(f"{cnt} jours."); st.rerun()
-
-    # AGGRID
     s, e = f"{yr}-{mo:02d}-01", f"{yr}-{mo:02d}-31"
     rows = run_query('SELECT * FROM pointages WHERE salarie_id=%s AND date_pointage BETWEEN %s AND %s', (curr_emp['id'], s, e), fetch="all")
     db_pts = {str(r['date_pointage']): dict(r) for r in rows} if rows else {}
@@ -549,6 +597,22 @@ else:
             d_obj = dt.strptime(r['Date'], "%d/%m/%Y").strftime("%Y-%m-%d")
             db_save_pointage(curr_emp['id'], d_obj, cl(r['Matin Début']), cl(r['Matin Fin']), cl(r['Aprèm Début']), cl(r['Aprèm Fin']), r['Type'], r['Commentaire'])
         st.toast("Sauvegardé !", icon="✅"); st.rerun()
+
+    st.markdown("---")
+    col_u, col_f = st.columns([1, 3])
+    with col_f:
+        if st.button("✨ Remplir vides"):
+            cnt = 0
+            for d in days:
+                iso = d.strftime("%Y-%m-%d")
+                if iso not in db_pts:
+                    ms, me, ads, ae = get_config_for_day(curr_emp['config_horaires'], d)
+                    stat = "Normal"
+                    if feries.get(d): stat = "Normal"
+                    elif d.weekday() == 6: ms=me=ads=ae=None
+                    db_save_pointage(curr_emp['id'], iso, ms, me, ads, ae, stat, "")
+                    cnt += 1
+            st.success(f"{cnt} jours."); st.rerun()
 
     st.markdown("---")
     c1, c2, c3, c4 = st.columns(4)
