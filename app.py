@@ -236,7 +236,7 @@ def calculate_stats(sid, y, m, cfg):
             h25+=min(s,8); h50+=max(0,s-8)
     return {"tr": tr, "nr": nr, "nt": nt, "nc": nc, "nm": nm, "na": na, "ghs": ghs, "h25": h25, "h50": h50, "bk": banked, "pay": max(0, ghs-banked), "dbk": nr-nt, "det": det}
 
-def create_pdf(nom, per, st):
+def create_pdf_releve(nom, per, st):
     b = io.BytesIO(); doc = SimpleDocTemplate(b, pagesize=A4); el = []; s = getSampleStyleSheet()
     el.append(Paragraph(f"Relevé: {nom} - {per}", s['Heading1'])); el.append(Spacer(1, 0.5*cm))
     d = [["H. Trav.", f"{st['nr']:.2f}", "TR", f"{st['tr']}"], ["HS Tot", f"{st['ghs']:.2f}", "Congé", f"{st['nc']}"], ["A Payer", f"{st['pay']:.2f}", "Maladie", f"{st['nm']}"]]
@@ -341,11 +341,10 @@ with st.sidebar:
                 tid = next(s['id'] for s in act_sals if s['nom']==ts)
                 if st.button("🗄️ Archiver"): db_archive_salarie(tid); st.rerun()
                 
-                # CONFIRMATION SUPPRESSION
                 if st.button("🗑️ Demander Suppression"): st.session_state['confirm_delete_id'] = tid
                 if st.session_state.get('confirm_delete_id') == tid:
-                    st.error("⚠️ Irréversible ! Tout l'historique sera perdu.")
-                    if st.button("🔥 CONFIRMER SUPPRESSION DEFINITIVE"):
+                    st.error("⚠️ Irréversible !")
+                    if st.button("🔥 CONFIRMER"):
                         db_delete_salarie_total(tid)
                         st.session_state['confirm_delete_id'] = None
                         st.success("Supprimé."); st.rerun()
@@ -362,9 +361,9 @@ with st.sidebar:
     mode = st.radio("Mode", ["Nouveau", "Modifier"], horizontal=True)
     f_nom, f_alt, f_sch, f_id = "", False, get_default_schedule(), None
     
-    # CHARGEMENT DONNEES MODIF
+    emps = run_query("SELECT * FROM salaries WHERE is_archived=0", fetch="all")
+    
     if mode == "Modifier":
-        emps = run_query("SELECT * FROM salaries WHERE is_archived=0", fetch="all")
         if emps:
             sel = st.selectbox("Choisir", [e['nom'] for e in emps])
             e_obj = next(e for e in emps if e['nom'] == sel)
@@ -377,22 +376,9 @@ with st.sidebar:
     else:
         if st.session_state['curr_emp_id']: st.session_state['curr_emp_id'] = None; st.rerun()
 
-    # FORMULAIRE DANS SIDEBAR (STABILISÉ)
-    with st.form("config_salarie"):
-        use_alt = st.checkbox("Alternance", value=f_alt)
-        n_in = st.text_input("Nom", value=f_nom)
-        fp, fi = [], []
-        # On doit appeler les fonctions de rendu hors du form si on veut de l'interactivité bouton
-        # MAIS ici on veut stabiliser. On affiche les inputs simplement.
-        # Astuce : On sort les tabs du form pour le bouton de remplissage auto, ou on accepte que le bouton refresh le form.
-        # Pour faire simple et stable : on garde le render hors form ou on utilise session state pur.
-        # ICI : on laisse le form englober le bouton final uniquement pour la stabilité ultime.
-        # PROBLÈME : Les tabs et les boutons de remplissage auto dans un form Streamlit ne marchent pas bien ensemble.
-        # SOLUTION : On laisse les inputs LIBRES (comme avant) mais on ne sauve que sur le bouton.
-        pass 
-    
-    # APPROCHE HYBRIDE STABLE : Inputs libres, Bouton final = Action
-    # (Le form précédent causait des soucis de layout avec les tabs)
+    # INPUTS SANS FORMULAIRE POUR LE BOUTON "REMPLIR"
+    use_alt = st.checkbox("Alternance", value=f_alt)
+    n_in = st.text_input("Nom", value=f_nom)
     fp, fi = [], []
     if use_alt:
         t1, t2 = st.tabs(["Paire", "Impaire"])
@@ -401,8 +387,8 @@ with st.sidebar:
     else:
         fp = render_week_inputs_simple("std", f_sch['paire'])
         fi = fp
-
-    if st.button("💾 ENREGISTRER SALARIÉ"):
+        
+    if st.button("💾 SAUVEGARDER"):
         if n_in:
             ok, m = db_upsert_salarie(f_id, n_in, 1 if use_alt else 0, {'paire':fp, 'impaire':fi})
             if ok: st.success(m); st.rerun()
@@ -411,7 +397,7 @@ with st.sidebar:
     if st.button("Déconnexion", type="secondary"): st.session_state.logged_in=False; st.rerun()
 
 # --- MAIN ---
-st.title("🗓️ Paie & Planning")
+st.title("🗓️ Planning Cloud")
 employees = run_query("SELECT * FROM salaries WHERE is_archived=0", fetch="all")
 
 if not employees: st.warning("Créez un salarié.")
@@ -424,7 +410,6 @@ else:
     yr = c2.number_input("Année", 2024, 2030, today.year)
     mo = c3.selectbox("Mois", range(1, 13), index=today.month-1, format_func=lambda x: calendar.month_name[x])
     stats = calculate_stats(curr_emp['id'], yr, mo, curr_emp['config_horaires'])
-    
     with c4:
         st.write("")
         c_b1, c_b2 = st.columns(2)
@@ -443,22 +428,23 @@ else:
             out.seek(0); st.download_button("⬇️", out, f"Paie_Global_{mo}_{yr}.xlsx")
         if c_b2.button("📄 PDF"):
             pdf = create_pdf_releve(curr_emp['nom'], f"{mo}/{yr}", stats)
-            st.download_button("⬇️", pdf, f"Releve.pdf", "application/pdf")
+            st.download_button("⬇️", pdf, f"Releve_{curr_emp['nom']}.pdf", "application/pdf")
 
     st.markdown("### 🗓️ Saisie")
     col_undo, col_fill = st.columns([1, 3])
     with col_undo:
         cnt = len(st.session_state.undo_stack)
-        if st.button(f"↩️ Annuler ({cnt})", disabled=cnt==0): 
-            if undo_restore(): st.rerun()
+        if st.button(f"↩️ Annuler ({cnt})", disabled=cnt==0):
+            if restore_last_state(): st.toast("Annulé !"); st.rerun()
     with col_fill:
         if st.button("✨ Remplir vides"):
-            undo_save(curr_emp['id'], yr, mo)
-            cnt = 0; ld = calendar.monthrange(yr, mo)[1]
-            exist = run_query('SELECT date_pointage FROM pointages WHERE salarie_id=%s AND date_pointage BETWEEN %s AND %s', (curr_emp['id'], f"{yr}-{mo:02d}-01", f"{yr}-{mo:02d}-{ld}"), fetch="all")
-            ex_d = [str(r['date_pointage']) for r in exist] if exist else []
+            save_state_for_undo(curr_emp['id'], yr, mo)
+            ld = calendar.monthrange(yr, mo)[1]
+            existing = run_query('SELECT date_pointage FROM pointages WHERE salarie_id=%s AND date_pointage BETWEEN %s AND %s', (curr_emp['id'], f"{yr}-{mo:02d}-01", f"{yr}-{mo:02d}-{ld}"), fetch="all")
+            ex_d = [str(r['date_pointage']) for r in existing] if existing else []
             days = [date(yr, mo, d) for d in range(1, ld+1)]
             feries = JoursFeries.for_year(yr)
+            cnt = 0
             for d in days:
                 iso = d.strftime("%Y-%m-%d")
                 if iso not in ex_d:
@@ -522,26 +508,24 @@ else:
     st.markdown("---")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.subheader("🏖️ Absences")
+        st.subheader("Absences")
         st.write(f"Congés: **{stats['nb_conge']}**")
         st.write(f"Maladie: **{stats['nb_maladie']}**")
-        st.write(f"Injust.: **{stats['nb_abs']}**")
     with c2:
-        st.subheader("💰 Paie")
+        st.subheader("Paie")
         st.write(f"HS Tot: **{stats['gen_hs_total']:.2f}h**")
         st.write(f"Banked: **-{stats['banked']:.2f}h**")
         st.metric("Reste", f"{stats['hs_payable']:.2f} h")
     with c3:
-        st.subheader("🏦 Transfert")
+        st.subheader("Transfert")
         with st.form("trf"):
             amt = st.number_input("Heures", max_value=float(stats['hs_payable']))
             if st.form_submit_button("Verser"):
                 db_update_banque(curr_emp['id'], amt, f"Transf HS {mo}/{yr}", "Auto")
                 st.rerun()
     with c4:
-        st.subheader("📊 Solde / TR")
-        st.metric("SOLDE", f"{curr_emp['solde_banque']:.2f} h")
-        st.metric("🎟️", f"{stats['total_tr']}")
+        st.subheader("Banque")
+        st.metric("Solde", f"{curr_emp['solde_banque']:.2f} h")
         with st.expander("Correction"):
             with st.form("adj"):
                 v = st.number_input("+/-"); m = st.text_input("Motif")
