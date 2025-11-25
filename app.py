@@ -75,7 +75,7 @@ def init_db():
         '''CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password TEXT, is_admin INTEGER DEFAULT 0, is_active INTEGER DEFAULT 0)'''
     ]
     for q in queries: run_query(q, fetch="none")
-init_db()
+# init_db()
 
 # --- UTILITAIRES TEMPS ---
 def str_to_time(t): return dt.strptime(t, "%H:%M").time() if t else None
