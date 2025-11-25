@@ -1,27 +1,3 @@
-# --- FIX OBLIGATOIRE POUR STREAMLIT CLOUD (Force l'IPv4) ---
-import socket
-
-# On sauvegarde l'ancienne fonction pour ne pas la casser
-try:
-    # On vérifie si on l'a déjà fait pour ne pas le faire 2 fois
-    if not hasattr(socket, '_getaddrinfo_orig'):
-        socket._getaddrinfo_orig = socket.getaddrinfo
-
-    def getaddrinfo_ipv4_only(*args, **kwargs):
-        # On demande toutes les adresses
-        responses = socket._getaddrinfo_orig(*args, **kwargs)
-        # On ne garde que les adresses classiques (AF_INET = IPv4)
-        return [r for r in responses if r[0] == socket.AF_INET]
-
-    # On remplace la fonction officielle par la nôtre
-    socket.getaddrinfo = getaddrinfo_ipv4_only
-except Exception as e:
-    print(f"Erreur lors du patch IPv4: {e}")
-# -----------------------------------------------------------
-
-import streamlit as st
-# ... le reste de vos imports (pandas, sqlite3, etc.) continue ici ...
-
 import streamlit as st
 import pandas as pd
 import psycopg2
@@ -64,12 +40,15 @@ OPTIONS_STATUT = ["Normal", "Congé", "Arrêt Maladie", "Absence Injustifiée", 
 STD_MS, STD_ME, STD_AS, STD_AE = "08:30", "12:00", "14:00", "17:30"
 
 # --- SESSION STATE ---
-if 'undo_stack' not in st.session_state: st.session_state.undo_stack = []
 if 'logged_in' not in st.session_state: st.session_state.logged_in = False
 if 'username' not in st.session_state: st.session_state.username = ""
 if 'is_admin' not in st.session_state: st.session_state.is_admin = False
 if 'curr_emp_id' not in st.session_state: st.session_state['curr_emp_id'] = None
 if 'confirm_delete_id' not in st.session_state: st.session_state['confirm_delete_id'] = None
+
+# ==================================================================================
+# 1. FONCTIONS SYSTEME & BDD
+# ==================================================================================
 
 # --- CONNEXION SUPABASE ---
 @st.cache_resource
@@ -98,7 +77,7 @@ def init_db():
     for q in queries: run_query(q, fetch="none")
 init_db()
 
-# --- UTILITAIRES ---
+# --- UTILITAIRES TEMPS ---
 def str_to_time(t): return dt.strptime(t, "%H:%M").time() if t else None
 def time_to_str(t): return t.strftime("%H:%M") if t else None
 def calc_duree_journee(m_s, m_e, a_s, a_e):
@@ -127,7 +106,7 @@ def get_default_schedule():
     week = [std.copy() for _ in range(5)] + [empty.copy()] + [empty.copy()]
     return {'paire': week, 'impaire': week}
 
-# --- DB ACTIONS ---
+# --- FONCTIONS BASE DE DONNEES ---
 def db_upsert_salarie(id_s, nom, mode, sched):
     j = json.dumps(sched)
     chk = run_query("SELECT id FROM salaries WHERE nom=%s", (nom,), fetch="one")
@@ -155,9 +134,12 @@ def db_update_banque(s_id, montant, motif, type_mouv="Manuel"):
     td = date.today().strftime("%Y-%m-%d")
     run_query('INSERT INTO banque_history (salarie_id, date_mouv, montant, motif, type_mouv, auteur) VALUES (%s,%s,%s,%s,%s,%s)', (s_id, td, montant, motif, type_mouv, aut), fetch="none")
     run_query('UPDATE salaries SET solde_banque = solde_banque + %s WHERE id = %s', (montant, s_id), fetch="none")
+
 def db_get_transferred_hs_for_month(s_id, month_label):
-    row = run_query('SELECT SUM(montant) as total FROM banque_history WHERE salarie_id=%s AND motif LIKE %s', (s_id, f"%HS Mois {month_label}%"), fetch="one")
+    pattern = f"%HS% {month_label}%"
+    row = run_query('SELECT SUM(montant) as total FROM banque_history WHERE salarie_id=%s AND motif LIKE %s', (s_id, pattern), fetch="one")
     return row['total'] if row['total'] else 0.0
+
 def db_get_banque_history(s_id): return run_query('SELECT * FROM banque_history WHERE salarie_id=%s ORDER BY id DESC', (s_id,), fetch="all")
 def db_get_pointages(s_id, y, m):
     last = calendar.monthrange(y, m)[1]
@@ -203,14 +185,15 @@ def restore_backup_json(f):
         return True
     except Exception as e: st.error(f"Err: {e}"); return False
 
-# --- CALC STATS ---
+# --- CALCUL STATS (HARMONISÉ) ---
 def calculate_stats(sid, y, m, cfg):
     db_pts = db_get_pointages(sid, y, m)
     banked = db_get_transferred_hs_for_month(sid, f"{m}/{y}")
     _, last = calendar.monthrange(y, m)
     days = [date(y, m, d) for d in range(1, last+1)]
     feries = JoursFeries.for_year(y)
-    wh, tr, nr, nt, nc, nm, na, det = {}, 0, 0, 0, 0, 0, 0, []
+    wh, nr, nt, nc, nm, na, tr, det = {}, 0, 0, 0, 0, 0, 0, []
+    
     for d in days:
         row = db_pts.get(d.strftime("%Y-%m-%d"), {})
         stt = row.get('statut', 'Normal')
@@ -219,30 +202,50 @@ def calculate_stats(sid, y, m, cfg):
         if not row: rms=rme=ras=rae=None; stt="Normal"
         hr = calc_duree_journee(rms, rme, ras, rae)
         ht = calc_duree_journee(tms, tme, tas, tae)
+        
+        # Compteurs
         if stt=="Congé": nc+=1
         elif stt=="Arrêt Maladie": nm+=1
         elif stt=="Absence Injustifiée": na+=1
+        
         if has_ticket_resto({'statut':stt,'m_start':rms,'m_end':rme,'a_start':ras,'a_end':rae}): tr+=1
+        
         h_bk = ht if (stt!="Normal" and stt!="Récupération") else (0.0 if stt=="Récupération" else hr)
         nr+=h_bk; nt+=ht
         wn=d.isocalendar()[1]
         if wn not in wh: wh[wn]=0.0
         wh[wn]+=hr
         det.append({"Date": d.strftime("%d/%m/%Y"), "Jour": DAYS_FR[d.weekday()], "Statut": stt, "Matin": f"{rms}-{rme}" if rms else "", "Aprem": f"{ras}-{rae}" if ras else "", "Heures": hr})
+    
     h25, h50, ghs = 0, 0, 0
     for w, h in wh.items():
         if h>35:
             s = h-35; ghs+=s
             h25+=min(s,8); h50+=max(0,s-8)
-    return {"tr": tr, "nr": nr, "nt": nt, "nc": nc, "nm": nm, "na": na, "ghs": ghs, "h25": h25, "h50": h50, "bk": banked, "pay": max(0, ghs-banked), "dbk": nr-nt, "det": det}
+            
+    # RETOUR DICTIONNAIRE
+    return {
+        "total_real": nr, 
+        "total_tr": tr, 
+        "nb_conge": nc, 
+        "nb_maladie": nm, 
+        "nb_abs": na, 
+        "gen_hs_total": ghs, 
+        "hs_25": h25, 
+        "hs_50": h50, 
+        "banked": banked, 
+        "hs_payable": max(0, ghs-banked), 
+        "delta_bank": nr-nt, 
+        "details": det
+    }
 
 def create_pdf_releve(nom, per, st):
     b = io.BytesIO(); doc = SimpleDocTemplate(b, pagesize=A4); el = []; s = getSampleStyleSheet()
     el.append(Paragraph(f"Relevé: {nom} - {per}", s['Heading1'])); el.append(Spacer(1, 0.5*cm))
-    d = [["H. Trav.", f"{st['nr']:.2f}", "TR", f"{st['tr']}"], ["HS Tot", f"{st['ghs']:.2f}", "Congé", f"{st['nc']}"], ["A Payer", f"{st['pay']:.2f}", "Maladie", f"{st['nm']}"]]
+    d = [["H. Trav.", f"{st['total_real']:.2f}", "TR", f"{st['total_tr']}"], ["HS Tot", f"{st['gen_hs_total']:.2f}", "Congé", f"{st['nb_conge']}"], ["A Payer", f"{st['hs_payable']:.2f}", "Maladie", f"{st['nb_maladie']}"]]
     t = Table(d, colWidths=[4*cm,3*cm,4*cm,3*cm]); t.setStyle(TableStyle([('GRID',(0,0),(-1,-1),1,colors.black),('BACKGROUND',(0,0),(-1,-1),colors.whitesmoke)])); el.append(t); el.append(Spacer(1, 0.5*cm))
     det = [["Date","Jour","Statut","M","A","Tot"]]
-    for r in st['det']: det.append([r['Date'],r['Jour'][:3],r['Statut'][:10],r['Matin'],r['Aprem'],f"{r['Heures']:.2f}"])
+    for r in st['details']: det.append([r['Date'],r['Jour'][:3],r['Statut'][:10],r['Matin'],r['Aprem'],f"{r['Heures']:.2f}"])
     t2 = Table(det, colWidths=[2.5*cm,2*cm,3*cm,3*cm,3*cm,1.5*cm]); t2.setStyle(TableStyle([('GRID',(0,0),(-1,-1),0.5,colors.grey)])); el.append(t2); doc.build(el); b.seek(0)
     return b
 
@@ -267,20 +270,7 @@ def render_week_inputs_simple(prefix, default_data):
         new_data.append({'ms': time_to_str(ms), 'me': time_to_str(me), 'as': time_to_str(ads), 'ae': time_to_str(ae)})
     return new_data
 
-def undo_save(sid, y, m):
-    pts = db_get_pointages(sid, y, m)
-    st.session_state.undo_stack.append({'sid': sid, 'y': y, 'm': m, 'd': pts})
-    if len(st.session_state.undo_stack)>5: st.session_state.undo_stack.pop(0)
-def undo_restore():
-    if not st.session_state.undo_stack: return False
-    s = st.session_state.undo_stack.pop()
-    ld = calendar.monthrange(s['y'], s['m'])[1]
-    run_query("DELETE FROM pointages WHERE salarie_id=%s AND date_pointage BETWEEN %s AND %s", (s['sid'], f"{s['y']}-{s['m']:02d}-01", f"{s['y']}-{s['m']:02d}-{ld}"), fetch="none")
-    for d, r in s['d'].items():
-        run_query("INSERT INTO pointages VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)", (r['id'], r['salarie_id'], r['date_pointage'], r['m_start'], r['m_end'], r['a_start'], r['a_end'], r['statut'], r['comment']), fetch="none")
-    return True
-
-# --- LOGIN ---
+# --- LOGIN UI ---
 if not st.session_state.logged_in:
     st.title("☁️ Connexion")
     with st.expander("📤 RESTAURER"):
@@ -308,7 +298,7 @@ if not st.session_state.logged_in:
 with st.sidebar:
     role = "Admin" if st.session_state.is_admin else "User"
     st.write(f"👤 **{st.session_state.username}** ({role})")
-    st.download_button("⬇️ BACKUP", create_backup_json(), f"Backup_{date.today()}.json", "application/json")
+    st.download_button("⬇️ BACKUP JSON", create_backup_json(), f"Backup_{date.today()}.json", "application/json")
     st.markdown("---")
     
     if st.session_state.is_admin:
@@ -333,22 +323,17 @@ with st.sidebar:
                 elif act == "Co-Admin" and st.button("Promouvoir"): admin_actions_user("promote", tu); st.rerun()
                 elif act == "Transférer droits" and st.button("Transférer"): admin_actions_user("transfer", tu); st.session_state.is_admin=False; st.rerun()
                 elif act == "Rétrograder" and st.button("Enlever Admin"): admin_actions_user("demote", tu); st.rerun()
-
-        with st.expander("Salariés (Archives/Suppr)"):
+        
+        with st.expander("Salariés (Archives)"):
             act_sals = run_query("SELECT * FROM salaries WHERE is_archived=0", fetch="all")
             if act_sals:
                 ts = st.selectbox("Actif", [s['nom'] for s in act_sals])
                 tid = next(s['id'] for s in act_sals if s['nom']==ts)
                 if st.button("🗄️ Archiver"): db_archive_salarie(tid); st.rerun()
-                
-                if st.button("🗑️ Demander Suppression"): st.session_state['confirm_delete_id'] = tid
+                if st.button("🗑️ Demander Suppr"): st.session_state['confirm_delete_id'] = tid
                 if st.session_state.get('confirm_delete_id') == tid:
                     st.error("⚠️ Irréversible !")
-                    if st.button("🔥 CONFIRMER"):
-                        db_delete_salarie_total(tid)
-                        st.session_state['confirm_delete_id'] = None
-                        st.success("Supprimé."); st.rerun()
-            
+                    if st.button("🔥 CONFIRMER"): db_delete_salarie_total(tid); st.session_state['confirm_delete_id']=None; st.rerun()
             arc_sals = run_query("SELECT * FROM salaries WHERE is_archived=1", fetch="all")
             if arc_sals:
                 st.write("---")
@@ -376,7 +361,6 @@ with st.sidebar:
     else:
         if st.session_state['curr_emp_id']: st.session_state['curr_emp_id'] = None; st.rerun()
 
-    # INPUTS SANS FORMULAIRE POUR LE BOUTON "REMPLIR"
     use_alt = st.checkbox("Alternance", value=f_alt)
     n_in = st.text_input("Nom", value=f_nom)
     fp, fi = [], []
@@ -388,7 +372,7 @@ with st.sidebar:
         fp = render_week_inputs_simple("std", f_sch['paire'])
         fi = fp
         
-    if st.button("💾 SAUVEGARDER"):
+    if st.button("💾 SAUVEGARDER CONFIG"):
         if n_in:
             ok, m = db_upsert_salarie(f_id, n_in, 1 if use_alt else 0, {'paire':fp, 'impaire':fi})
             if ok: st.success(m); st.rerun()
@@ -400,7 +384,7 @@ with st.sidebar:
 st.title("🗓️ Planning Cloud")
 employees = run_query("SELECT * FROM salaries WHERE is_archived=0", fetch="all")
 
-if not employees: st.warning("Créez un salarié.")
+if not employees: st.warning("Aucun salarié actif.")
 else:
     c1, c2, c3, c4 = st.columns([2, 1, 1, 1.5])
     emp_map = {e['nom']: e for e in employees}
@@ -409,7 +393,10 @@ else:
     today = date.today()
     yr = c2.number_input("Année", 2024, 2030, today.year)
     mo = c3.selectbox("Mois", range(1, 13), index=today.month-1, format_func=lambda x: calendar.month_name[x])
+    
+    # --- CALCUL DES STATS ---
     stats = calculate_stats(curr_emp['id'], yr, mo, curr_emp['config_horaires'])
+    
     with c4:
         st.write("")
         c_b1, c_b2 = st.columns(2)
@@ -419,7 +406,7 @@ else:
                 g_rows = []
                 for emp in employees:
                     s = calculate_stats(emp['id'], yr, mo, emp['config_horaires'])
-                    g_rows.append({"Salarié": emp['nom'], "H. Trav": s['total_real'], "Congés": s['nb_conge'], "HS 25%": s['hs_25'], "HS 50%": s['hs_50'], "Reste Payer": s['hs_payable'], "Solde Bq": emp['solde_banque'] + s['dbk']})
+                    g_rows.append({"Salarié": emp['nom'], "H. Trav": s['total_real'], "Congés": s['nb_conge'], "HS 25%": s['hs_25'], "HS 50%": s['hs_50'], "Reste Payer": s['hs_payable'], "Solde Bq": emp['solde_banque'] + s['delta_bank']})
                 pd.DataFrame(g_rows).to_excel(w, index=False, sheet_name="Global")
                 for emp in employees:
                     s = calculate_stats(emp['id'], yr, mo, emp['config_horaires'])
@@ -431,14 +418,9 @@ else:
             st.download_button("⬇️", pdf, f"Releve_{curr_emp['nom']}.pdf", "application/pdf")
 
     st.markdown("### 🗓️ Saisie")
-    col_undo, col_fill = st.columns([1, 3])
-    with col_undo:
-        cnt = len(st.session_state.undo_stack)
-        if st.button(f"↩️ Annuler ({cnt})", disabled=cnt==0):
-            if restore_last_state(): st.toast("Annulé !"); st.rerun()
+    col_fill, col_dummy = st.columns([1, 3])
     with col_fill:
         if st.button("✨ Remplir vides"):
-            save_state_for_undo(curr_emp['id'], yr, mo)
             ld = calendar.monthrange(yr, mo)[1]
             existing = run_query('SELECT date_pointage FROM pointages WHERE salarie_id=%s AND date_pointage BETWEEN %s AND %s', (curr_emp['id'], f"{yr}-{mo:02d}-01", f"{yr}-{mo:02d}-{ld}"), fetch="all")
             ex_d = [str(r['date_pointage']) for r in existing] if existing else []
@@ -478,7 +460,6 @@ else:
         is_s = 1 if d.weekday() == 6 else 0
         if is_f and not cmt: cmt = f"Férié : {feries.get(d)}"
         data_list.append({"Date": d_fr, "Jour": DAYS_FR[d.weekday()], "Type": stat, "Matin Début": rms, "Matin Fin": rme, "Aprèm Début": ras, "Aprèm Fin": rae, "Total": h_real, "TR": nb_tr, "Commentaire": cmt, "is_ferie": is_f, "is_sun": is_s})
-    
     df = pd.DataFrame(data_list)
     gb = GridOptionsBuilder.from_dataframe(df)
     gb.configure_column("is_ferie", hide=True); gb.configure_column("is_sun", hide=True)
@@ -486,19 +467,20 @@ else:
     gb.configure_column("Type", editable=True, cellEditor='agSelectCellEditor', cellEditorParams={'values': OPTIONS_STATUT}, width=130)
     gb.configure_column("Commentaire", editable=True, width=200)
     for c in ["Matin Début", "Matin Fin", "Aprèm Début", "Aprèm Fin"]: gb.configure_column(c, editable=True, width=90)
+    
     jscode = JsCode("""function(params) {
-        if (params.data.Type === 'Normal' && (!params.data['Matin Début'] || params.data['Matin Début'] === '00:00' || params.data['Matin Début'] === 'None')) return {'background-color': '#fff9c4', 'color': 'black'};
-        if (params.data.is_ferie === 1 || params.data.is_sun === 1) return {'background-color': '#e0e0e0', 'color': 'black'};
-        if (params.data.Type === 'Arrêt Maladie') return {'background-color': '#ffb3b3', 'color': 'black'};
-        if (params.data.Type === 'Congé') return {'background-color': '#b3d9ff', 'color': 'black'};
-        if (params.data.Type === 'Absence Injustifiée') return {'background-color': '#ff4d4d', 'color': 'white'};
-        return {'background-color': 'white', 'color': 'black'};
+        let style = {'color': 'black', 'background-color': 'white'};
+        if (params.data.is_ferie === 1 || params.data.is_sun === 1) style['background-color'] = '#e0e0e0';
+        if (params.data.Type === 'Arrêt Maladie') style['background-color'] = '#ffb3b3';
+        if (params.data.Type === 'Congé') style['background-color'] = '#b3d9ff';
+        if (params.data.Type === 'Absence Injustifiée') { style['background-color'] = '#ff4d4d'; style['color'] = 'white'; }
+        if (params.data.Type === 'Récupération') style['background-color'] = '#ccffcc';
+        return style;
     }""")
     gb.configure_grid_options(getRowStyle=jscode)
     grid_resp = AgGrid(df, gridOptions=gb.build(), height=500, allow_unsafe_jscode=True, theme='streamlit', update_mode=GridUpdateMode.VALUE_CHANGED)
     updated_df = pd.DataFrame(grid_resp['data'])
     if st.button("💾 SAUVEGARDER SAISIE", type="primary"):
-        undo_save(curr_emp['id'], yr, mo)
         for i, r in updated_df.iterrows():
             def cl(v): return v if v and v != "None" and v != "" else None
             d_obj = dt.strptime(r['Date'], "%d/%m/%Y").strftime("%Y-%m-%d")
@@ -508,24 +490,26 @@ else:
     st.markdown("---")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.subheader("Absences")
+        st.subheader("🏖️ Absences")
         st.write(f"Congés: **{stats['nb_conge']}**")
         st.write(f"Maladie: **{stats['nb_maladie']}**")
+        st.write(f"Injust.: **{stats['nb_abs']}**")
     with c2:
-        st.subheader("Paie")
+        st.subheader("💰 Paie")
         st.write(f"HS Tot: **{stats['gen_hs_total']:.2f}h**")
         st.write(f"Banked: **-{stats['banked']:.2f}h**")
         st.metric("Reste", f"{stats['hs_payable']:.2f} h")
     with c3:
-        st.subheader("Transfert")
+        st.subheader("🏦 Transfert")
         with st.form("trf"):
             amt = st.number_input("Heures", max_value=float(stats['hs_payable']))
             if st.form_submit_button("Verser"):
                 db_update_banque(curr_emp['id'], amt, f"Transf HS {mo}/{yr}", "Auto")
                 st.rerun()
     with c4:
-        st.subheader("Banque")
-        st.metric("Solde", f"{curr_emp['solde_banque']:.2f} h")
+        st.subheader("📊 Solde / TR")
+        st.metric("SOLDE BANQUE", f"{curr_emp['solde_banque']:.2f} h")
+        st.metric("🎟️ TR", f"{stats['total_tr']}")
         with st.expander("Correction"):
             with st.form("adj"):
                 v = st.number_input("+/-"); m = st.text_input("Motif")
