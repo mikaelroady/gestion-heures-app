@@ -1,3 +1,27 @@
+# --- FIX OBLIGATOIRE POUR STREAMLIT CLOUD (Force l'IPv4) ---
+import socket
+
+# On sauvegarde l'ancienne fonction pour ne pas la casser
+try:
+    # On vérifie si on l'a déjà fait pour ne pas le faire 2 fois
+    if not hasattr(socket, '_getaddrinfo_orig'):
+        socket._getaddrinfo_orig = socket.getaddrinfo
+
+    def getaddrinfo_ipv4_only(*args, **kwargs):
+        # On demande toutes les adresses
+        responses = socket._getaddrinfo_orig(*args, **kwargs)
+        # On ne garde que les adresses classiques (AF_INET = IPv4)
+        return [r for r in responses if r[0] == socket.AF_INET]
+
+    # On remplace la fonction officielle par la nôtre
+    socket.getaddrinfo = getaddrinfo_ipv4_only
+except Exception as e:
+    print(f"Erreur lors du patch IPv4: {e}")
+# -----------------------------------------------------------
+
+import streamlit as st
+# ... le reste de vos imports (pandas, sqlite3, etc.) continue ici ...
+
 import streamlit as st
 import pandas as pd
 import psycopg2
