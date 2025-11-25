@@ -39,7 +39,7 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import cm
 
-# --- FIX OBLIGATOIRE POUR STREAMLIT CLOUD ---
+# --- FIX IPV4 ---
 try:
     if not hasattr(socket, '_getaddrinfo_orig'):
         socket._getaddrinfo_orig = socket.getaddrinfo
@@ -201,7 +201,6 @@ def db_get_banque_history(s_id):
     return run_query('SELECT * FROM banque_history WHERE salarie_id=%s ORDER BY id DESC', (s_id,), fetch="all")
 
 def db_get_pointages(s_id, y, m):
-    # CORRECTION DATE FIN DE MOIS
     last_day = calendar.monthrange(y, m)[1]
     s, e = f"{y}-{m:02d}-01", f"{y}-{m:02d}-{last_day}"
     rows = run_query('SELECT * FROM pointages WHERE salarie_id=%s AND date_pointage BETWEEN %s AND %s', (s_id, s, e), fetch="all")
@@ -270,6 +269,7 @@ def calculate_stats(salarie_id, year, month, config_horaires):
     banked = row_b['total'] if row_b and row_b['total'] else 0.0
     _, last = calendar.monthrange(year, month)
     days = [date(year, month, d) for d in range(1, last+1)]
+    feries = JoursFeries.for_year(year)
     weekly_hours = {}
     total_real, total_theo = 0.0, 0.0
     nb_conge, nb_maladie, nb_abs, total_tr = 0, 0, 0, 0
@@ -282,17 +282,13 @@ def calculate_stats(salarie_id, year, month, config_horaires):
         rms, rme = row.get('m_start'), row.get('m_end')
         ras, rae = row.get('a_start'), row.get('a_end')
         tms, tme, tas, tae = get_config_for_day(config_horaires, d)
-        
         if d_iso not in db_pts: rms=rme=ras=rae=None; stat="Normal"
-        
         h_real = calc_duree_journee(rms, rme, ras, rae)
         h_theo = calc_duree_journee(tms, tme, tas, tae)
-        
         if stat == "Congé": nb_conge += 1
         elif stat == "Arrêt Maladie": nb_maladie += 1
         elif stat == "Absence Injustifiée": nb_abs += 1
         if has_ticket_resto({'statut': stat, 'm_start': rms, 'm_end': rme, 'a_start': ras, 'a_end': rae}): total_tr += 1
-
         if stat != "Normal" and stat != "Récupération": h_real_bank = h_theo
         elif stat == "Récupération": h_real_bank = 0.0
         else: h_real_bank = h_real
@@ -332,26 +328,6 @@ def create_pdf_releve(nom, per, st):
     buf.seek(0)
     return buf
 
-# --- UNDO ---
-def save_state_for_undo(s_id, year, month):
-    current_data = db_get_pointages(s_id, year, month)
-    st.session_state.undo_stack.append({'s_id': s_id, 'year': year, 'month': month, 'data': current_data})
-    if len(st.session_state.undo_stack) > 5: st.session_state.undo_stack.pop(0)
-
-def restore_last_state():
-    if not st.session_state.undo_stack: return False
-    last_state = st.session_state.undo_stack.pop()
-    s_id, year, month = last_state['s_id'], last_state['year'], last_state['month']
-    data = last_state['data']
-    conn = get_db_connection()
-    last_day = calendar.monthrange(year, month)[1]
-    s_date, e_date = f"{year}-{month:02d}-01", f"{year}-{month:02d}-{last_day}"
-    run_query("DELETE FROM pointages WHERE salarie_id=%s AND date_pointage BETWEEN %s AND %s", (s_id, s_date, e_date), fetch="none")
-    for d_str, row in data.items():
-        run_query('INSERT INTO pointages (salarie_id, date_pointage, m_start, m_end, a_start, a_end, statut, comment) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)', 
-                  (s_id, d_str, row['m_start'], row['m_end'], row['a_start'], row['a_end'], row['statut'], row['comment']), fetch="none")
-    return True
-
 def render_week_inputs_simple(prefix, default_data):
     if st.button("⚡ Remplir Formulaire", key=f"btn_{prefix}"):
         for i in range(5): 
@@ -375,7 +351,7 @@ def render_week_inputs_simple(prefix, default_data):
 
 # --- UI LOGIN ---
 if not st.session_state.logged_in:
-    st.title("☁️ Connexion")
+    st.title("☁️ Connexion Supabase")
     with st.expander("📤 RESTAURER (JSON)", expanded=False):
         up_json = st.file_uploader("Backup", type=['json'])
         if up_json and st.button("⚠️ CONFIRMER RESTAURATION"):
@@ -417,7 +393,7 @@ with st.sidebar:
             c1,c2 = st.columns(2)
             if c1.button("✅"): admin_actions_user("approve", tp); st.rerun()
             if c2.button("❌"): admin_actions_user("reject", tp); st.rerun()
-        with st.expander("Gestion Utilisateurs"):
+        with st.expander("Gestion"):
             if active:
                 tu = st.selectbox("Cible", active)
                 act = st.selectbox("Action", ["Reset MDP", "Supprimer", "Co-Admin", "Donner droits", "Rétrograder"])
@@ -433,7 +409,6 @@ with st.sidebar:
                 elif act == "Rétrograder":
                     if st.button("Enlever Admin"): admin_actions_user("demote", tu); st.rerun()
         
-        # --- GESTION ARCHIVES ---
         with st.expander("Salariés (Archives/Suppr)"):
             sals_active = run_query("SELECT * FROM salaries WHERE is_archived=0", fetch="all")
             if sals_active:
@@ -449,13 +424,20 @@ with st.sidebar:
                 ts = st.selectbox("Restaurer", [s['nom'] for s in sals_arch])
                 sid = next(s['id'] for s in sals_arch if s['nom'] == ts)
                 if st.button("♻️ Restaurer"): db_restore_salarie(sid); st.rerun()
+                st.caption("Export rapide d'un mois :")
+                arc_y = st.number_input("An", 2020, 2030, date.today().year, key="ay")
+                arc_m = st.number_input("Mois", 1, 12, 1, key="am")
+                if st.button("Générer PDF Archive"):
+                    s_obj = next(s for s in sals_arch if s['id'] == sid)
+                    stats_arch = calculate_stats(sid, arc_y, arc_m, s_obj['config_horaires'])
+                    pdf = create_pdf_releve(s_obj['nom'], f"{arc_m}/{arc_y}", stats_arch)
+                    st.download_button("Télécharger PDF", pdf, "archive.pdf", "application/pdf")
 
     st.markdown("---")
     st.header("⚙️ Salarié")
     mode = st.radio("Mode", ["Nouveau", "Modifier"], horizontal=True)
     f_nom, f_alt, f_sch, f_id = "", False, get_default_schedule(), None
     
-    # Filtre pour n'afficher que les actifs dans le menu modif
     emps = run_query("SELECT * FROM salaries WHERE is_archived=0", fetch="all")
     
     if mode == "Modifier":
@@ -491,7 +473,6 @@ with st.sidebar:
 
 # --- MAIN ---
 st.title("🗓️ Planning Cloud")
-# Affichage principal : Uniquement les actifs
 employees = run_query("SELECT * FROM salaries WHERE is_archived=0", fetch="all")
 
 if not employees: st.warning("Aucun salarié actif.")
@@ -533,9 +514,10 @@ else:
     with col_fill:
         if st.button("✨ Remplir vides"):
             save_state_for_undo(curr_emp['id'], yr, mo)
-            existing = run_query('SELECT date_pointage FROM pointages WHERE salarie_id=%s AND date_pointage BETWEEN %s AND %s', (curr_emp['id'], f"{yr}-{mo:02d}-01", f"{yr}-{mo:02d}-{calendar.monthrange(yr, mo)[1]}"), fetch="all")
+            last_day = calendar.monthrange(yr, mo)[1]
+            existing = run_query('SELECT date_pointage FROM pointages WHERE salarie_id=%s AND date_pointage BETWEEN %s AND %s', (curr_emp['id'], f"{yr}-{mo:02d}-01", f"{yr}-{mo:02d}-{last_day}"), fetch="all")
             exist_dates = [str(r['date_pointage']) for r in existing] if existing else []
-            days = [date(yr, mo, d) for d in range(1, calendar.monthrange(yr, mo)[1]+1)]
+            days = [date(yr, mo, d) for d in range(1, last_day+1)]
             feries = JoursFeries.for_year(yr)
             cnt = 0
             for d in days:
@@ -549,10 +531,12 @@ else:
                     cnt += 1
             st.success(f"{cnt} jours."); st.rerun()
 
-    s, e = f"{yr}-{mo:02d}-01", f"{yr}-{mo:02d}-{calendar.monthrange(yr, mo)[1]}"
+    # AGGRID
+    last_day = calendar.monthrange(yr, mo)[1]
+    s, e = f"{yr}-{mo:02d}-01", f"{yr}-{mo:02d}-{last_day}"
     rows = run_query('SELECT * FROM pointages WHERE salarie_id=%s AND date_pointage BETWEEN %s AND %s', (curr_emp['id'], s, e), fetch="all")
     db_pts = {str(r['date_pointage']): dict(r) for r in rows} if rows else {}
-    days = [date(yr, mo, d) for d in range(1, calendar.monthrange(yr, mo)[1]+1)]
+    days = [date(yr, mo, d) for d in range(1, last_day+1)]
     feries = JoursFeries.for_year(yr)
     data_list = []
     for d in days:
@@ -577,16 +561,28 @@ else:
     gb.configure_column("Type", editable=True, cellEditor='agSelectCellEditor', cellEditorParams={'values': OPTIONS_STATUT}, width=130)
     gb.configure_column("Commentaire", editable=True, width=200)
     for c in ["Matin Début", "Matin Fin", "Aprèm Début", "Aprèm Fin"]: gb.configure_column(c, editable=True, width=90)
+    
+    # JSCODE : COULEUR TEXTE NOIR PAR DÉFAUT (Pour le mode sombre) + ALERTE JAUNE
     jscode = JsCode("""function(params) {
+        let style = {'color': 'black', 'background-color': 'white'};
+        
+        // Alerte Jaune si jour Normal ET Matin vide
         if (params.data.Type === 'Normal' && (!params.data['Matin Début'] || params.data['Matin Début'] === '00:00' || params.data['Matin Début'] === 'None')) {
-             return {'background-color': '#fff9c4'};
+             style['background-color'] = '#fff9c4';
         }
-        if (params.data.is_ferie === 1 || params.data.is_sun === 1) return {'background-color': '#e0e0e0'};
-        if (params.data.Type === 'Arrêt Maladie') return {'background-color': '#ffb3b3'};
-        if (params.data.Type === 'Congé') return {'background-color': '#b3d9ff'};
-        if (params.data.Type === 'Absence Injustifiée') return {'background-color': '#ff4d4d', 'color': 'white'};
-        return {'background-color': 'white'};
+        
+        if (params.data.is_ferie === 1 || params.data.is_sun === 1) style['background-color'] = '#e0e0e0';
+        if (params.data.Type === 'Arrêt Maladie') style['background-color'] = '#ffb3b3';
+        if (params.data.Type === 'Congé') style['background-color'] = '#b3d9ff';
+        if (params.data.Type === 'Absence Injustifiée') { 
+            style['background-color'] = '#ff4d4d'; 
+            style['color'] = 'white'; 
+        }
+        if (params.data.Type === 'Récupération') style['background-color'] = '#ccffcc';
+        
+        return style;
     }""")
+    
     gb.configure_grid_options(getRowStyle=jscode)
     grid_resp = AgGrid(df, gridOptions=gb.build(), height=500, allow_unsafe_jscode=True, theme='streamlit', update_mode=GridUpdateMode.VALUE_CHANGED)
     updated_df = pd.DataFrame(grid_resp['data'])
@@ -611,7 +607,7 @@ else:
         st.write(f"Banked: **-{stats['banked']:.2f}h**")
         st.metric("Reste", f"{stats['hs_payable']:.2f} h")
     with c3:
-        st.subheader("Transfert")
+        st.subheader("🏦 Transfert")
         with st.form("trf"):
             amt = st.number_input("Heures", max_value=float(stats['hs_payable']))
             if st.form_submit_button("Verser"):
