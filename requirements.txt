@@ -1,0 +1,7 @@
+streamlit
+pandas
+openpyxl
+jours-feries-france
+streamlit-aggrid
+reportlab
+psycopg2-binary
